@@ -1,0 +1,12 @@
+[project]
+name = "preprocess"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "autodistill>=0.1.29",
+    "autodistill-grounding-dino>=0.1.4",
+    "autodistill-yolov8>=0.1.4",
+    "yt-dlp>=2026.2.21",
+]
