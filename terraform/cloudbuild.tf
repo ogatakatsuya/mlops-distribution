@@ -3,7 +3,9 @@
 #
 # 前提: GitHubリポジトリとのOAuth接続は事前にコンソールで設定が必要
 # 手順: Cloud Build → Triggers → Connect Repository
+# github_owner / github_repo が両方設定されている場合のみ作成
 resource "google_cloudbuild_trigger" "mlops_pipeline" {
+  count = (var.github_owner != "" && var.github_repo != "") ? 1 : 0
   name        = "mlops-pipeline-trigger"
   description = "config.yaml の変更を検知してVTuber検出パイプラインを自動実行"
   location    = "global"

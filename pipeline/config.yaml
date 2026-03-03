@@ -1,0 +1,12 @@
+# パイプラインのハイパーパラメータ設定
+# このファイルを変更して Git Push するだけでパイプラインが自動実行される
+
+data_version: v1          # GCS 上のデータセットバージョン（datasets/<version>/）
+epochs: 5                 # 学習エポック数（増やすと精度UP、時間もUP）
+lr0: 0.01                 # 初期学習率
+freeze: 10                # バックボーンの固定レイヤー数（転移学習の速度に影響）
+imgsz: 640                # 入力画像サイズ
+patience: 10              # Early stopping の patience
+map_threshold: 0.3        # この mAP50 を超えた場合のみ Model Registry へ登録・デプロイ
+machine_type: n1-standard-4
+accelerator_type: NVIDIA_TESLA_T4

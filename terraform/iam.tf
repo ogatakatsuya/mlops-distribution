@@ -80,19 +80,3 @@ resource "google_project_iam_member" "vertex_ai_artifact_registry" {
   role    = "roles/artifactregistry.reader"
   member  = "serviceAccount:${google_service_account.vertex_ai.email}"
 }
-
-# ─────────────────────────────────────────
-# Cloud Run 用サービスアカウント
-# Streamlit アプリが Vertex AI Endpoint を呼び出す
-# ─────────────────────────────────────────
-resource "google_service_account" "cloud_run" {
-  account_id   = "mlops-cloud-run"
-  display_name = "MLOps Cloud Run SA"
-  description  = "Streamlit アプリが Vertex AI Endpoint へ推論リクエストを送るSA"
-}
-
-resource "google_project_iam_member" "cloud_run_aiplatform" {
-  project = var.project_id
-  role    = "roles/aiplatform.user"
-  member  = "serviceAccount:${google_service_account.cloud_run.email}"
-}

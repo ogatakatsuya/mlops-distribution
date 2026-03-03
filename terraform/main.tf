@@ -19,8 +19,7 @@ resource "google_project_service" "apis" {
     "aiplatform.googleapis.com",       # Vertex AI (学習・デプロイ・Pipelines)
     "storage.googleapis.com",          # Cloud Storage (データ・モデル保管)
     "cloudbuild.googleapis.com",       # Cloud Build (CI/CD トリガー)
-    "artifactregistry.googleapis.com", # Artifact Registry (Dockerイメージ)
-    "run.googleapis.com",              # Cloud Run (アプリケーション)
+    "artifactregistry.googleapis.com", # Artifact Registry (パイプラインコンポーネントイメージ)
   ])
 
   service            = each.value

@@ -42,11 +42,6 @@ output "vertex_ai_service_account" {
   value       = google_service_account.vertex_ai.email
 }
 
-output "cloud_run_service_account" {
-  description = "Cloud Run 用サービスアカウント（アプリデプロイ時に指定）"
-  value       = google_service_account.cloud_run.email
-}
-
 output "next_steps" {
   description = "terraform apply 後の次のステップ"
   value       = <<-EOT
@@ -60,6 +55,9 @@ output "next_steps" {
        export REGION=${var.region}
        export ENDPOINT_ID=${google_vertex_ai_endpoint.vtuber_detector.name}
 
-    3. Phase 2: Vertex AI Custom Training Job で学習を実行
+    3. Phase 2: Vertex AI Custom Training Job で学習を実行 (epochs=3, epochs=5)
+       python src/submit_job.py
+
+    ※ アプリはローカルで動作させる。MLOpsの責務はEndpointへの自動デプロイまで。
   EOT
 }

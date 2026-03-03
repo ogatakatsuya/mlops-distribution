@@ -1,5 +1,5 @@
-# アプリケーション用 Docker イメージの保存先
-# Cloud Run にデプロイする Streamlit アプリのイメージを格納
+# パイプラインコンポーネント用 Docker イメージの保存先
+# Vertex AI Pipelines の各ステップで使うコンテナイメージを格納
 resource "google_artifact_registry_repository" "mlops" {
   repository_id = "mlops"
   location      = var.region

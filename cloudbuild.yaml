@@ -1,0 +1,43 @@
+# Cloud Build 設定
+# pipeline/config.yaml への Push で Terraform の Cloud Build Trigger が自動発火する
+#
+# 前提（Phase 0 で一度だけ手動実行）:
+#   REGION=asia-northeast1
+#   docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/mlops/vtuber-predictor:latest serve/
+#   docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/mlops/vtuber-predictor:latest
+#
+# 代入変数（Terraform の Cloud Build Trigger が自動設定）:
+#   _PROJECT_ID  : GCP プロジェクト ID
+#   _REGION      : リージョン（例: asia-northeast1）
+#   _ENDPOINT_ID : Vertex AI Endpoint のフルリソース名
+
+steps:
+  # Step 1: src/train.py を GCS へアップロード
+  # パイプラインの学習コンポーネントが GCS 経由でこのスクリプトを参照する
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: upload-train-script
+    args:
+      - gsutil
+      - cp
+      - src/train.py
+      - gs://${_PROJECT_ID}-mlops-data/scripts/train.py
+
+  # Step 2: パイプライン定義をコンパイルして Vertex AI Pipelines へ投入
+  - name: "python:3.11"
+    id: submit-pipeline
+    waitFor: ["upload-train-script"]
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install \
+          "google-cloud-aiplatform>=1.60.0" \
+          "kfp>=2.0" \
+          "pyyaml>=6.0" \
+          -q
+        PYTHONPATH=/workspace python pipeline/definition.py \
+          --project_id=${_PROJECT_ID} \
+          --region=${_REGION} \
+          --endpoint_id=${_ENDPOINT_ID}
+
+timeout: "600s"
