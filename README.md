@@ -3,7 +3,7 @@
 **「`config.yaml` を変えて Push するだけで、本番の AI が自動更新される」** 体験を Google Cloud で学ぶハンズオンです。
 
 YOLO26n を使ってオリジナルの VTuber キャラクター検出モデルを作り、
-Vertex AI Pipelines による自動学習・評価・デプロイまでを構築します。
+Vertex AI Pipelines による自動学習・デプロイまでを構築します。
 
 ---
 
@@ -22,22 +22,20 @@ Vertex AI Pipelines による自動学習・評価・デプロイまでを構築
 pipeline/config.yaml を変更して git push
         │
         ▼
-[Cloud Build Trigger]          ← Phase 6 で自動化
+[Cloud Build Trigger]
+  ├─ trainer イメージをビルド & push  ┐ 並列
+  └─ serving イメージをビルド & push  ┘
         │
         ▼
-[Vertex AI Pipelines]
-  Step 1: データセット確認 (GCS)
-  Step 2: YOLO26n 転移学習 (GPU Custom Training Job)
-  Step 3: mAP50 評価・閾値チェック
-        │ 閾値超過のみ
-  Step 4: Vertex AI Model Registry に登録
-  Step 5: Vertex AI Endpoint へ自動デプロイ
+[Vertex AI Pipelines] ← Cloud Build はここで即終了
+  Step 1: YOLO26n 学習 (Custom Training Job)
+  Step 2: Cloud Run サービスのモデルを更新
         │
         ▼
-[Vertex AI Endpoint] ← モデルが変わっても Endpoint ID は不変
+[Cloud Run] ← 起動時に GCS からモデルをダウンロード
         │
         ▼
-  ローカルアプリから推論リクエスト
+  demo/ アプリから推論リクエスト
 ```
 
 ---
@@ -48,12 +46,13 @@ pipeline/config.yaml を変更して git push
 |---|---|
 | インフラ管理 | Terraform + Google Cloud |
 | データ・モデル管理 | Cloud Storage (GCS) |
-| 実験管理 | Vertex AI Experiments |
+| 自動ラベリング | Grounding DINO (autodistill) |
 | 学習モデル | YOLO26n (Ultralytics) |
+| 実験追跡 | Weights & Biases |
 | パイプライン | Vertex AI Pipelines (KFP v2) |
-| CI/CD トリガー | Cloud Build |
-| 推論エンドポイント | Vertex AI Endpoint |
-| 推論サーバー | FastAPI (serve/) |
+| CI/CD | Cloud Build |
+| 推論サーバー | FastAPI + Cloud Run |
+| デモ UI | Streamlit |
 
 ---
 
@@ -64,10 +63,9 @@ pipeline/config.yaml を変更して git push
 | Google Cloud SDK | `gcloud --version` |
 | Terraform >= 1.5 | `terraform --version` |
 | Docker | `docker --version` |
-| Python >= 3.11 | `python3 --version` |
+| Python >= 3.11 + uv | `uv --version` |
 
 ```bash
-# GCP 認証
 gcloud auth login
 gcloud auth application-default login
 ```
@@ -77,153 +75,176 @@ gcloud auth application-default login
 ## フェーズ構成
 
 ```
-Phase 0: 環境準備（Terraform + 推論コンテナビルド）
-Phase 1: データセット管理（GCS アップロード）
-Phase 2: 実験管理（Vertex AI Experiments で比較）
-Phase 5: パイプライン化（Vertex AI Pipelines）
-Phase 6: 自動化（Cloud Build Trigger）
+Phase 0: インフラ構築 (Terraform)
+Phase 1: データセット GCS アップロード
+Phase 5: パイプライン実行 (Cloud Build → Vertex AI)
+Phase 6: Push 自動化 (Cloud Build Trigger)
 ```
-
-> Phase 3（Model Registry 登録）と Phase 4（Endpoint デプロイ）は
-> Phase 5 のパイプライン内ステップとして実装されています。
 
 ---
 
-### Phase 0-A: インフラ構築（Terraform）
-
-GCS・Artifact Registry・Vertex AI Endpoint・IAM を作成します。
+### Phase 0: インフラ構築
 
 ```bash
-export PROJECT_ID=<your-gcp-project-id>
-bash scripts/phase0_terraform.sh
+cd terraform
+terraform init
+terraform apply
 ```
 
 **作成されるリソース:**
 - GCS バケット: `{PROJECT_ID}-mlops-data`（データ・モデル用）
 - GCS バケット: `{PROJECT_ID}-mlops-pipeline`（パイプラインルート用）
 - Artifact Registry: `{REGION}-docker.pkg.dev/{PROJECT_ID}/mlops`
-- Vertex AI Endpoint: `vtuber-detector`（IDを固定）
+- Cloud Run サービス: `vtuber-detector`（初回は placeholder）
 - IAM サービスアカウント: `mlops-vertex-ai`, `mlops-cloud-build`
 
 ---
 
-### Phase 0-B: 推論コンテナのビルド & プッシュ
+### データセットの作成
 
-Vertex AI Endpoint で使う YOLO 推論サーバーを Artifact Registry へ登録します。
-モデルが更新されても推論ロジックが変わらない限り、**再実行不要**です。
+`vtuber_dataset/` は以下の手順で作成します。
 
 ```bash
-bash scripts/phase0_serving.sh
+cd preprocess
+
+# 1. VTuber の配信動画からフレームを抽出
+python frame.py
+
+# 2. Grounding DINO でキャラクターごとに自動ラベリング
+#    キャラクターごとに別オントロジーで実行し、混入を防ぐ
+uv run python distill.py
+
+# 3. ラベルのクリーンアップ（混入チェック）
+#    debidebi フレームに runrun ボックスが入っている場合などを除去
+uv run python fix_labels.py
+```
+
+**`distill.py` の注意点:**
+
+`CHARACTERS` 辞書にキャラクターごとの Grounding DINO プロンプトを定義します。
+**1 つのオントロジーに複数キャラを混ぜると検出が混入するため、必ずキャラクターを分けて実行してください。**
+
+```python
+CHARACTERS = {
+    "debidebi": ("anime vtuber girl with cat ears and dark outfit", "debidebi"),
+    "runrun":   ("anime vtuber girl with white bunny ears",         "runrun"),
+}
+```
+
+**データセット構造（YOLO 形式）:**
+```
+vtuber_dataset/
+├── data.yaml
+├── train/
+│   ├── images/   debidebi_frame_*.jpg, runrun_frame_*.jpg
+│   └── labels/   同名の .txt（class_id cx cy w h）
+└── valid/
+    ├── images/
+    └── labels/
+```
+
+**データセットビジュアライザー:**
+
+ラベルが正しいか確認するための Streamlit アプリ。
+
+```bash
+cd demo
+uv run streamlit run dataset_viewer.py
 ```
 
 ---
 
 ### Phase 1: データセットを GCS へアップロード
 
-ローカルの `vtuber_dataset/` を GCS に同期します（差分のみ転送）。
-
 ```bash
+# v1 としてアップロード（デフォルト）
 bash scripts/phase1_dataset.sh
+
+# バージョンを指定する場合
+DATASET_VERSION=v2 bash scripts/phase1_dataset.sh
 ```
 
-**GCS のデータ構造:**
-```
-gs://{PROJECT_ID}-mlops-data/
-└── datasets/
-    └── v1/
-        ├── train/images/
-        ├── train/labels/
-        ├── valid/images/
-        ├── valid/labels/
-        └── data.yaml
-```
-
-> データを追加したら `v2/` として同じ構造でアップロードし、
-> `pipeline/config.yaml` の `data_version: v2` に変更してください。
+`pipeline/config.yaml` の `dataset.version` を合わせて変更してください。
 
 ---
 
-### Phase 2: 実験管理（Vertex AI Experiments）
+### Phase 5: パイプライン実行
 
-ハイパーパラメータを変えた 2 つの学習ジョブを投入して精度を比較します。
-
-```bash
-bash scripts/phase2_experiments.sh
-```
-
-**投入されるジョブ:**
-| ジョブ名 | epochs | lr0 |
-|---|---|---|
-| `epochs3-lr001` | 3 | 0.01 |
-| `epochs5-lr001` | 5 | 0.01 |
-
-**結果の確認:**
-[Vertex AI → Experiments](https://console.cloud.google.com/vertex-ai/experiments) で
-各ジョブの `mAP50` を比較できます。
-
----
-
-### Phase 5: パイプライン化（Vertex AI Pipelines）
-
-学習 → 評価 → 登録 → デプロイの全ステップを自動実行します。
-`map_threshold` を超えた場合のみ Endpoint が更新されます。
+Cloud Build でコンテナをビルドし、Vertex AI Pipelines へパイプラインを投入します。
+Cloud Build はパイプライン submit 後に即終了し、学習・デプロイは Vertex AI が非同期で実行します。
 
 ```bash
+# W&B でメトリクスを記録する場合
+export WANDB_API_KEY=<your-wandb-api-key>
+
 bash scripts/phase5_pipeline.sh
-```
-
-**パイプラインのステップ:**
-
-```
-validate_data → train_model → check_accuracy → register_model → deploy_model
-                                     │
-                              mAP50 < 閾値なら
-                              ここで終了（デプロイしない）
 ```
 
 **設定ファイル:** `pipeline/config.yaml`
 
 ```yaml
-data_version: v1    # 使用するデータセットバージョン
-epochs: 5           # 学習エポック数
-lr0: 0.01           # 初期学習率
-freeze: 10          # バックボーン固定レイヤー数
-map_threshold: 0.3  # この mAP50 を超えた場合のみデプロイ
+model:
+  architecture: yolo26n
+  epochs: 100
+  batch_size: 16
+  image_size: 640
+
+dataset:
+  version: v2
+
+training:
+  machine_type: n1-highmem-4
 ```
+
+**パイプラインの流れ:**
+
+```
+Cloud Build
+  ├─ build-trainer  (src/)   ┐ 並列ビルド
+  └─ build-serving  (serve/) ┘
+        ↓ push 完了後
+  submit-pipeline → 即終了
+
+Vertex AI Pipelines（非同期）
+  train_component  → yolo-train-{BUILD_ID} Custom Job を起動・完了待ち
+  deploy_component → Cloud Run の AIP_STORAGE_URI を新モデルパスに更新
+```
+
+**進捗確認:**
+- [Cloud Build](https://console.cloud.google.com/cloud-build/builds)
+- [Vertex AI Pipelines](https://console.cloud.google.com/vertex-ai/pipelines)
+- [Custom Training Jobs](https://console.cloud.google.com/vertex-ai/training/custom-jobs)
 
 ---
 
-### Phase 6: 自動化（Cloud Build Trigger）
+### Phase 6: 自動化（Push トリガー）
 
 `pipeline/config.yaml` を変更して Push するだけでパイプラインが自動実行されます。
 
 **事前準備:** GCP コンソールで GitHub リポジトリを接続してください
 > Cloud Build → Triggers → [Connect Repository](https://console.cloud.google.com/cloud-build/triggers)
 
+`terraform/variables.tf` に `github_owner` と `github_repo` を設定して `terraform apply` するとトリガーが作成されます。
+
 ```bash
-export GITHUB_OWNER=<your-github-username>
-export GITHUB_REPO=<your-repo-name>
-bash scripts/phase6_trigger.sh
+# config.yaml を変更して push するだけ
+vim pipeline/config.yaml
+git add pipeline/config.yaml && git commit -m "update config" && git push
 ```
 
-**体験フロー:**
+---
+
+### デモアプリ
+
 ```bash
-# 1. config.yaml を変更
-vim pipeline/config.yaml   # epochs: 5 → 10 に変更
+cd demo
+uv run streamlit run app.py
+```
 
-# 2. Push するだけでパイプラインが自動実行
-git add pipeline/config.yaml
-git commit -m "increase epochs to 10"
-git push
+サイドバーで **API モード** を選択し、エンドポイント URL を設定：
 
-# 3. Cloud Build で自動実行を確認
-# https://console.cloud.google.com/cloud-build/builds
-
-# 4. Vertex AI Pipelines で進捗を確認
-# https://console.cloud.google.com/vertex-ai/pipelines
-
-# 5. 精度が閾値を超えると Endpoint が自動更新される
-# アプリのコードは一切触っていないのに検出精度が向上している
+```
+https://<CLOUD_RUN_URL>/predict
 ```
 
 ---
@@ -232,57 +253,33 @@ git push
 
 ```
 .
-├── setup.sh                 # 全フェーズ一括実行
 ├── cloudbuild.yaml          # Cloud Build 設定
 ├── pipeline/
-│   ├── config.yaml          # ← 受講者が変更するファイル
-│   ├── definition.py        # KFP パイプライン定義
-│   └── components/
-│       ├── download_data.py # Step 1: データ確認
-│       ├── train.py         # Step 2: YOLO26n 学習
-│       ├── evaluate.py      # Step 3: mAP 評価
-│       ├── register.py      # Step 4: Model Registry 登録
-│       └── deploy.py        # Step 5: Endpoint デプロイ
+│   ├── config.yaml          # ← 変更してパイプラインを制御するファイル
+│   ├── definition.py        # KFP パイプライン定義 (train → deploy)
+│   └── submit.py            # パイプラインコンパイル & 投入スクリプト
 ├── scripts/
-│   ├── common.sh            # 共通関数・変数
 │   ├── phase0_terraform.sh
-│   ├── phase0_serving.sh
 │   ├── phase1_dataset.sh
-│   ├── phase2_experiments.sh
 │   ├── phase5_pipeline.sh
 │   └── phase6_trigger.sh
 ├── serve/
-│   ├── app.py               # FastAPI 推論サーバー
+│   ├── app.py               # FastAPI 推論サーバー（起動時に GCS からモデルをロード）
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── src/
-│   ├── train.py             # Custom Training Job スクリプト
-│   ├── submit_job.py        # Phase 2 用ジョブ投入スクリプト
+│   ├── train.py             # Custom Training Job スクリプト（W&B 対応）
+│   ├── Dockerfile
 │   └── requirements.txt
-├── terraform/               # インフラ定義（一度だけ実行）
-└── preprocess/              # データセット作成ツール（参考）
-    ├── distill.py           # GroundingDINO による自動ラベリング
-    ├── frame.py             # 動画からフレーム抽出
-    └── download.py          # 動画ダウンロード
-```
-
----
-
-## データセットの作り方（参考）
-
-`vtuber_dataset/` は以下の手順で作成しました。自分のキャラクターで試す場合に参考にしてください。
-
-```bash
-cd preprocess
-
-# 1. VTuber の配信動画をダウンロード
-python download.py
-
-# 2. 動画からフレームを抽出
-python frame.py
-
-# 3. GroundingDINO で自動ラベリング → YOLO 形式データセットを生成
-python distill.py
+├── demo/
+│   ├── app.py               # Streamlit 推論デモ（Local / API モード）
+│   └── dataset_viewer.py    # データセットビジュアライザー
+├── preprocess/
+│   ├── distill.py           # Grounding DINO による自動ラベリング
+│   ├── fix_labels.py        # ラベル混入クリーンアップ
+│   ├── frame.py             # 動画からフレーム抽出
+│   └── download.py          # 動画ダウンロード
+└── terraform/               # インフラ定義
 ```
 
 ---
@@ -291,9 +288,9 @@ python distill.py
 
 | 項目 | URL |
 |---|---|
-| Vertex AI Experiments | https://console.cloud.google.com/vertex-ai/experiments |
-| Vertex AI Pipelines | https://console.cloud.google.com/vertex-ai/pipelines |
-| Vertex AI Model Registry | https://console.cloud.google.com/vertex-ai/models |
-| Vertex AI Endpoints | https://console.cloud.google.com/vertex-ai/endpoints |
 | Cloud Build 履歴 | https://console.cloud.google.com/cloud-build/builds |
+| Vertex AI Pipelines | https://console.cloud.google.com/vertex-ai/pipelines |
+| Custom Training Jobs | https://console.cloud.google.com/vertex-ai/training/custom-jobs |
+| Cloud Run | https://console.cloud.google.com/run |
 | GCS バケット | https://console.cloud.google.com/storage/browser |
+| Artifact Registry | https://console.cloud.google.com/artifacts |
