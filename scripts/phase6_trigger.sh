@@ -6,40 +6,34 @@
 #       Cloud Build → Triggers → Connect Repository
 #
 # 使い方:
-#   export PROJECT_ID=<your-project>
 #   export GITHUB_OWNER=<github-username>
 #   export GITHUB_REPO=<repo-name>
 #   bash scripts/phase6_trigger.sh
 set -euo pipefail
-# shellcheck source=scripts/common.sh
-source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-log "Phase 6: Cloud Build Trigger を設定"
-check_project_id
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT/terraform"
 
-[[ -n "$GITHUB_OWNER" ]] || err "GITHUB_OWNER が未設定です (export GITHUB_OWNER=<username>)"
-[[ -n "$GITHUB_REPO"  ]] || err "GITHUB_REPO が未設定です (export GITHUB_REPO=<repo>)"
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
+REGION="${REGION:-asia-northeast1}"
 
-pushd "${PROJECT_ROOT}/terraform" > /dev/null
+[ -n "${GITHUB_OWNER:-}" ] || { echo "ERROR: GITHUB_OWNER が未設定です"; exit 1; }
+[ -n "${GITHUB_REPO:-}"  ] || { echo "ERROR: GITHUB_REPO が未設定です"; exit 1; }
+
+echo "=== Phase 6: Cloud Build Trigger ==="
+echo "  GitHub : ${GITHUB_OWNER}/${GITHUB_REPO}"
+echo ""
 
 terraform apply \
   -auto-approve \
   -input=false \
   -var="project_id=${PROJECT_ID}" \
-  -var="region=${REGION}"         \
+  -var="region=${REGION}" \
   -var="github_owner=${GITHUB_OWNER}" \
-  -var="github_repo=${GITHUB_REPO}"   \
-  -var="github_branch=${GITHUB_BRANCH}"
+  -var="github_repo=${GITHUB_REPO}" \
+  -var="github_branch=${GITHUB_BRANCH:-main}"
 
-popd > /dev/null
-
-ok "Cloud Build Trigger を作成しました"
 echo ""
-echo "  これで pipeline/config.yaml を変更して git push するだけで"
-echo "  パイプラインが自動実行されます。"
-echo ""
-echo "  体験フロー:"
-echo "    1. pipeline/config.yaml の epochs を 5 → 10 に変更"
-echo "    2. git commit -m 'increase epochs' && git push"
-echo "    3. Cloud Build で自動実行を確認: https://console.cloud.google.com/cloud-build/builds"
-echo "    4. Pipeline 完了後に Endpoint が自動更新される"
+echo "=== 完了 ==="
+echo "pipeline/config.yaml を変更して git push するだけでパイプラインが自動実行されます。"
+echo "確認: https://console.cloud.google.com/cloud-build/builds"

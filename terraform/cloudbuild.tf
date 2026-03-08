@@ -29,7 +29,7 @@ resource "google_cloudbuild_trigger" "mlops_pipeline" {
   substitutions = {
     _PROJECT_ID  = var.project_id
     _REGION      = var.region
-    _ENDPOINT_ID = google_vertex_ai_endpoint.vtuber_detector.name
+    _ENDPOINT_ID = google_cloud_run_v2_service.serving.name
   }
 
   depends_on = [

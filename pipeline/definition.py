@@ -1,148 +1,148 @@
-#!/usr/bin/env python3
 """
 Vertex AI Pipelines パイプライン定義。
-Cloud Build から自動実行、またはローカルから手動実行も可能。
 
-使い方:
-  export PROJECT_ID=<your-project>
-  export ENDPOINT_ID=$(cd terraform && terraform output -raw endpoint_id)
-  python pipeline/definition.py --project_id=$PROJECT_ID --endpoint_id=$ENDPOINT_ID
+コンポーネント:
+  train_component  : Custom Training Job を投入して完了を待つ (Vertex AI が管理)
+  deploy_component : Cloud Run サービスのイメージと AIP_STORAGE_URI を更新する
 """
-import argparse
-import datetime
-import sys
-from pathlib import Path
-
-import yaml
-from google.cloud import aiplatform
-from kfp import compiler, dsl
-
-# Cloud Build・ローカル問わず import が通るようプロジェクトルートを追加
-ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT))
-
-from pipeline.components.download_data import validate_data
-from pipeline.components.train import train_model
-from pipeline.components.evaluate import check_accuracy
-from pipeline.components.register import register_model
-from pipeline.components.deploy import deploy_model
+from kfp import dsl
 
 
-@dsl.pipeline(
-    name="vtuber-detection-pipeline",
-    description="VTuberキャラクター検出モデルの学習・評価・デプロイ自動化パイプライン",
+@dsl.component(
+    base_image="python:3.11-slim",
+    packages_to_install=["google-cloud-aiplatform"],
 )
-def vtuber_pipeline(
-    project_id: str,
+def train_component(
+    project: str,
     region: str,
     data_bucket: str,
-    data_version: str,
-    experiment: str,
-    run_name: str,
+    dataset_version: str,
+    trainer_image: str,
     epochs: int,
-    lr0: float,
-    freeze: int,
-    imgsz: int,
-    patience: int,
-    map_threshold: float,
+    batch_size: int,
+    image_size: int,
+    model_arch: str,
     machine_type: str,
-    accelerator_type: str,
-    endpoint_id: str,
-    vertex_ai_sa: str,
-) -> None:
-    # Step 1: データセット確認
-    validate_op = validate_data(
-        project_id=project_id,
-        data_bucket=data_bucket,
-        data_version=data_version,
+    service_account: str,
+    build_id: str,
+    wandb_api_key: str = "",
+    wandb_project: str = "vtuber-detector",
+) -> str:
+    """Custom Training Job を投入して完了を待ち、モデル出力先 GCS URI を返す。"""
+    from google.cloud import aiplatform
+
+    model_gcs_dir = f"gs://{data_bucket}/models/{build_id}"
+
+    aiplatform.init(
+        project=project,
+        location=region,
+        staging_bucket=f"gs://{data_bucket}",
     )
 
-    # Step 2: YOLO26n 転移学習（GPU Custom Training Job として実行）
-    train_op = train_model(
-        project_id=project_id,
+    job = aiplatform.CustomContainerTrainingJob(
+        display_name=f"yolo-train-{build_id}",
+        container_uri=trainer_image,
+    )
+
+    env_vars = {
+        "DATA_BUCKET":     data_bucket,
+        "DATASET_VERSION": dataset_version,
+        "EPOCHS":          str(epochs),
+        "BATCH":           str(batch_size),
+        "IMGSZ":           str(image_size),
+        "MODEL":           model_arch + ".pt",
+        "BUILD_ID":        build_id,
+        "WANDB_PROJECT":   wandb_project,
+    }
+    if wandb_api_key:
+        env_vars["WANDB_API_KEY"] = wandb_api_key
+
+    job.run(
+        base_output_dir=model_gcs_dir,
+        machine_type=machine_type,
+        replica_count=1,
+        environment_variables=env_vars,
+        service_account=service_account or None,
+        sync=True,
+    )
+
+    return model_gcs_dir
+
+
+@dsl.component(
+    base_image="python:3.11-slim",
+    packages_to_install=["google-cloud-run"],
+)
+def deploy_component(
+    project: str,
+    region: str,
+    service_name: str,
+    serving_image: str,
+    model_gcs_dir: str,
+):
+    """Cloud Run サービスのコンテナイメージと AIP_STORAGE_URI を更新する。"""
+    from google.cloud import run_v2
+
+    artifact_uri = model_gcs_dir.rstrip("/") + "/model"
+
+    client = run_v2.ServicesClient()
+    service_resource = f"projects/{project}/locations/{region}/services/{service_name}"
+
+    service = client.get_service(name=service_resource)
+
+    container = service.template.containers[0]
+    container.image = serving_image
+
+    env_map = {e.name: e.value for e in container.env}
+    env_map["AIP_STORAGE_URI"] = artifact_uri
+    container.env = [run_v2.EnvVar(name=k, value=v) for k, v in env_map.items()]
+
+    operation = client.update_service(service=service)
+    updated = operation.result()
+
+    print(f"Deployed: {updated.uri}")
+
+
+@dsl.pipeline(name="vtuber-detector-pipeline")
+def vtuber_pipeline(
+    project: str,
+    region: str,
+    data_bucket: str,
+    dataset_version: str,
+    trainer_image: str,
+    serving_image: str,
+    service_name: str,
+    build_id: str,
+    epochs: int = 5,
+    batch_size: int = 16,
+    image_size: int = 640,
+    model_arch: str = "yolov8n",
+    machine_type: str = "n1-highmem-4",
+    service_account: str = "",
+    wandb_api_key: str = "",
+    wandb_project: str = "vtuber-detector",
+):
+    train_task = train_component(
+        project=project,
         region=region,
         data_bucket=data_bucket,
-        data_version=data_version,
-        run_name=run_name,
+        dataset_version=dataset_version,
+        trainer_image=trainer_image,
         epochs=epochs,
-        lr0=lr0,
-        freeze=freeze,
-        imgsz=imgsz,
-        patience=patience,
-        experiment=experiment,
-        vertex_ai_sa=vertex_ai_sa,
-    ).after(validate_op)
-
-    # Step 3: mAP50 が閾値を超えているか評価
-    eval_op = check_accuracy(
-        mAP50=train_op.output,
-        threshold=map_threshold,
+        batch_size=batch_size,
+        image_size=image_size,
+        model_arch=model_arch,
+        machine_type=machine_type,
+        service_account=service_account,
+        build_id=build_id,
+        wandb_api_key=wandb_api_key,
+        wandb_project=wandb_project,
     )
 
-    # Step 4 & 5: 閾値通過時のみ Model Registry 登録 → Endpoint デプロイ
-    with dsl.Condition(eval_op.output == "deploy", name="accuracy-gate"):
-        register_op = register_model(
-            project_id=project_id,
-            region=region,
-            data_bucket=data_bucket,
-            run_name=run_name,
-        )
-        deploy_model(
-            project_id=project_id,
-            region=region,
-            model_resource_name=register_op.output,
-            endpoint_id=endpoint_id,
-        ).after(register_op)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="パイプラインをコンパイルして Vertex AI へ投入")
-    parser.add_argument("--project_id", required=True)
-    parser.add_argument("--region", default="asia-northeast1")
-    parser.add_argument("--endpoint_id", required=True)
-    args = parser.parse_args()
-
-    cfg = yaml.safe_load((ROOT / "pipeline" / "config.yaml").read_text())
-
-    data_bucket   = f"{args.project_id}-mlops-data"
-    pipeline_root = f"gs://{args.project_id}-mlops-pipeline/runs"
-    vertex_ai_sa  = f"mlops-vertex-ai@{args.project_id}.iam.gserviceaccount.com"
-    run_name      = datetime.datetime.utcnow().strftime("run-%Y%m%d-%H%M%S")
-
-    # コンパイル
-    pipeline_path = "/tmp/vtuber_pipeline.json"
-    compiler.Compiler().compile(vtuber_pipeline, pipeline_path)
-    print(f"Pipeline compiled → {pipeline_path}")
-
-    # Vertex AI Pipelines へ投入
-    aiplatform.init(project=args.project_id, location=args.region)
-    job = aiplatform.PipelineJob(
-        display_name=f"vtuber-pipeline-{run_name}",
-        template_path=pipeline_path,
-        pipeline_root=pipeline_root,
-        parameter_values={
-            "project_id":      args.project_id,
-            "region":          args.region,
-            "data_bucket":     data_bucket,
-            "data_version":    cfg["data_version"],
-            "experiment":      "yolo26-vtuber",
-            "run_name":        run_name,
-            "epochs":          cfg["epochs"],
-            "lr0":             cfg["lr0"],
-            "freeze":          cfg["freeze"],
-            "imgsz":           cfg.get("imgsz", 640),
-            "patience":        cfg.get("patience", 10),
-            "map_threshold":   cfg["map_threshold"],
-            "machine_type":    cfg["machine_type"],
-            "accelerator_type": cfg["accelerator_type"],
-            "endpoint_id":     args.endpoint_id,
-            "vertex_ai_sa":    vertex_ai_sa,
-        },
-    )
-    job.submit()
-    print(f"Pipeline submitted: {job.resource_name}")
-    print("Monitor: https://console.cloud.google.com/vertex-ai/pipelines")
-
-
-if __name__ == "__main__":
-    main()
+    deploy_component(
+        project=project,
+        region=region,
+        service_name=service_name,
+        serving_image=serving_image,
+        model_gcs_dir=train_task.output,
+    ).after(train_task)

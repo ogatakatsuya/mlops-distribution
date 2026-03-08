@@ -1,42 +1,44 @@
 #!/usr/bin/env bash
 # Phase 0: Terraform でインフラを構築する
-#
-# 使い方:
-#   export PROJECT_ID=<your-project>
-#   bash scripts/phase0_terraform.sh
 set -euo pipefail
-# shellcheck source=scripts/common.sh
-source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-log "Phase 0-A: Terraform (インフラ構築)"
-check_project_id
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT/terraform"
 
-pushd "${PROJECT_ROOT}/terraform" > /dev/null
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
+REGION="${REGION:-asia-northeast1}"
 
-terraform init -upgrade -input=false -reconfigure
+if [ -z "$PROJECT_ID" ]; then
+  echo "ERROR: PROJECT_ID が未設定です"
+  exit 1
+fi
+
+echo "=== Phase 0: Terraform Apply ==="
+echo "  Project : $PROJECT_ID"
+echo "  Region  : $REGION"
+echo ""
 
 TF_ARGS=(
   -auto-approve
   -input=false
   -var="project_id=${PROJECT_ID}"
   -var="region=${REGION}"
-  -var="github_branch=${GITHUB_BRANCH}"
 )
 
-if [[ -n "$GITHUB_OWNER" && -n "$GITHUB_REPO" ]]; then
+if [[ -n "${GITHUB_OWNER:-}" && -n "${GITHUB_REPO:-}" ]]; then
   TF_ARGS+=(
     -var="github_owner=${GITHUB_OWNER}"
     -var="github_repo=${GITHUB_REPO}"
+    -var="github_branch=${GITHUB_BRANCH:-main}"
   )
-  ok "Cloud Build Trigger を作成します (${GITHUB_OWNER}/${GITHUB_REPO})"
+  echo "  GitHub  : ${GITHUB_OWNER}/${GITHUB_REPO} (Cloud Build Trigger を作成)"
 else
-  warn "GITHUB_OWNER / GITHUB_REPO 未設定 → Cloud Build Trigger はスキップ"
-  warn "Phase 6 を体験する場合は phase6_trigger.sh を実行してください"
+  echo "  GitHub  : 未設定 (Cloud Build Trigger はスキップ)"
 fi
 
+terraform init -upgrade -input=false
 terraform apply "${TF_ARGS[@]}"
 
-ok "インフラ構築完了"
-ok "Endpoint ID: $(terraform output -raw endpoint_id)"
-
-popd > /dev/null
+echo ""
+echo "=== 完了 ==="
+echo "  Serving URL: $(terraform output -raw serving_url 2>/dev/null || echo '(未設定)')"

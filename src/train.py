@@ -1,150 +1,113 @@
 """
-Vertex AI Custom Training Job 上で実行される学習スクリプト。
-- GCS からデータセットをダウンロード
-- YOLO26n で転移学習
-- Vertex AI Experiments にメトリクスを記録
-- 学習済みモデルを GCS へアップロード
+Vertex AI Custom Training Job 用 YOLO 学習スクリプト。
+
+Vertex AI が注入する環境変数:
+  AIP_MODEL_DIR   : 学習済みモデルの出力先 GCS URI (例: gs://bucket/models/build-id)
+
+Cloud Build / submit_job.py が設定する環境変数:
+  DATA_BUCKET     : データセット・モデル保存用 GCS バケット名 (必須)
+  DATASET_VERSION : データセットバージョン (デフォルト: v1)
+  EPOCHS          : 学習エポック数 (デフォルト: 5)
+  BATCH           : バッチサイズ (デフォルト: 16)
+  IMGSZ           : 入力画像サイズ (デフォルト: 640)
+  MODEL           : ベースモデル名 (デフォルト: yolov8n.pt)
+  BUILD_ID        : Cloud Build ビルド ID (W&B ラン名に使用)
+  WANDB_API_KEY   : W&B API キー (省略可)
+  WANDB_PROJECT   : W&B プロジェクト名 (デフォルト: vtuber-detector)
 """
-import argparse
-import json
 import os
-import shutil
-import tempfile
+import sys
+import yaml
 from pathlib import Path
 
-import yaml
-from google.cloud import aiplatform, storage
+from google.cloud import storage
 from ultralytics import YOLO
 
-# ─────────────────────────────
-# 引数
-# ─────────────────────────────
-parser = argparse.ArgumentParser()
-parser.add_argument("--project_id",     type=str, required=True)
-parser.add_argument("--region",         type=str, default="asia-northeast1")
-parser.add_argument("--data_bucket",    type=str, default="")
-parser.add_argument("--data_version",   type=str, default="v1")
-parser.add_argument("--experiment",     type=str, default="yolo26-vtuber")
-parser.add_argument("--run_name",       type=str, required=True)  # 例: "epochs10-lr001"
-parser.add_argument("--epochs",         type=int, default=10)
-parser.add_argument("--lr0",            type=float, default=0.01)
-parser.add_argument("--freeze",         type=int, default=10)
-parser.add_argument("--imgsz",          type=int, default=640)
-parser.add_argument("--patience",       type=int, default=10)
-# ローカルデータを使う場合は --local_data_dir を指定（GCSダウンロードをスキップ）
-parser.add_argument("--local_data_dir", type=str, default="")
-args = parser.parse_args()
+# ── 環境変数 ──────────────────────────────────────────────────────────────
+DATA_BUCKET     = os.environ["DATA_BUCKET"]
+DATASET_VERSION = os.environ.get("DATASET_VERSION", "v1")
+AIP_MODEL_DIR   = os.environ["AIP_MODEL_DIR"]   # Vertex AI が自動設定
+EPOCHS          = int(os.environ.get("EPOCHS", "5"))
+BATCH           = int(os.environ.get("BATCH", "16"))
+IMGSZ           = int(os.environ.get("IMGSZ", "640"))
+MODEL           = os.environ.get("MODEL", "yolov8n.pt")
+BUILD_ID        = os.environ.get("BUILD_ID", "local")
+WANDB_API_KEY   = os.environ.get("WANDB_API_KEY", "")
+WANDB_PROJECT   = os.environ.get("WANDB_PROJECT", "vtuber-detector")
 
-LOCAL_DATA_DIR = Path(args.local_data_dir) if args.local_data_dir else Path("/tmp/dataset")
-LOCAL_RUN_DIR  = Path("/tmp/runs/train")
+LOCAL_DATASET = Path("/tmp/dataset")
+RUNS_DIR      = Path("/tmp/runs")
 
-# ─────────────────────────────
-# 1. Vertex AI Experiments 初期化
-# ─────────────────────────────
-aiplatform.init(
-    project=args.project_id,
-    location=args.region,
-    experiment=args.experiment,
+
+# ── 1. GCS からデータセットをダウンロード ────────────────────────────────
+print(f"[1/3] Downloading dataset: gs://{DATA_BUCKET}/datasets/{DATASET_VERSION}/")
+LOCAL_DATASET.mkdir(parents=True, exist_ok=True)
+
+gcs = storage.Client()
+bucket = gcs.bucket(DATA_BUCKET)
+prefix = f"datasets/{DATASET_VERSION}/"
+blobs = list(bucket.list_blobs(prefix=prefix))
+
+if not blobs:
+    print(f"ERROR: gs://{DATA_BUCKET}/{prefix} にファイルが見つかりません", file=sys.stderr)
+    sys.exit(1)
+
+for blob in blobs:
+    relative = blob.name[len(prefix):]
+    if not relative:
+        continue
+    dest = LOCAL_DATASET / relative
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    blob.download_to_filename(str(dest))
+    print(f"  {blob.name}")
+
+# data.yaml の path キーを絶対パスに書き換え (ultralytics が相対解釈するため)
+data_yaml_path = LOCAL_DATASET / "data.yaml"
+with open(data_yaml_path) as f:
+    data_cfg = yaml.safe_load(f)
+data_cfg["path"] = str(LOCAL_DATASET)
+with open(data_yaml_path, "w") as f:
+    yaml.dump(data_cfg, f)
+
+
+# ── 2. W&B セットアップ ────────────────────────────────────────────────────
+if WANDB_API_KEY:
+    import wandb
+    from ultralytics.utils import SETTINGS
+    wandb.login(key=WANDB_API_KEY)
+    SETTINGS.update({"wandb": True})
+    print(f"[W&B] enabled, project={WANDB_PROJECT} run={BUILD_ID}")
+else:
+    print("[W&B] WANDB_API_KEY 未設定 - W&B ログをスキップ")
+
+# ── 3. YOLO 学習 ──────────────────────────────────────────────────────────
+print(f"[2/3] Training {MODEL} for {EPOCHS} epochs (batch={BATCH}, imgsz={IMGSZ})")
+model = YOLO(MODEL)
+model.train(
+    data=str(data_yaml_path),
+    epochs=EPOCHS,
+    batch=BATCH,
+    imgsz=IMGSZ,
+    project=WANDB_PROJECT if WANDB_API_KEY else str(RUNS_DIR),
+    name=BUILD_ID,
+    exist_ok=True,
 )
 
-with aiplatform.start_run(run=args.run_name, resume=True):
 
-    aiplatform.log_params({
-        "epochs":       args.epochs,
-        "lr0":          args.lr0,
-        "freeze":       args.freeze,
-        "imgsz":        args.imgsz,
-        "patience":     args.patience,
-        "data_version": args.data_version,
-        "model":        "yolo26n",
-    })
+# ── 4. best.pt を AIP_MODEL_DIR (GCS) にアップロード ─────────────────────
+best_pt = RUNS_DIR / BUILD_ID / "weights" / "best.pt"
+if not best_pt.exists():
+    # W&B なしの場合は project=RUNS_DIR/train
+    best_pt = RUNS_DIR / "train" / "weights" / "best.pt"
+if not best_pt.exists():
+    print("ERROR: best.pt が見つかりません。学習が失敗した可能性があります。", file=sys.stderr)
+    sys.exit(1)
 
-    # ─────────────────────────────
-    # 2. データセット準備
-    # ─────────────────────────────
-    if args.local_data_dir:
-        # ローカル動作確認モード: GCS ダウンロードをスキップ
-        print(f"Using local dataset: {LOCAL_DATA_DIR}")
-    else:
-        # クラウド実行モード: GCS からダウンロード
-        print(f"Downloading dataset {args.data_version} from GCS...")
-        gcs = storage.Client(project=args.project_id)
-        bucket = gcs.bucket(args.data_bucket)
+gcs_uri    = AIP_MODEL_DIR.rstrip("/")
+after_gs   = gcs_uri[len("gs://"):]
+bucket_name, _, blob_prefix = after_gs.partition("/")
+blob_path  = f"{blob_prefix}/best.pt" if blob_prefix else "best.pt"
 
-        LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        blobs = bucket.list_blobs(prefix=f"datasets/{args.data_version}/")
-        for blob in blobs:
-            relative = blob.name.replace(f"datasets/{args.data_version}/", "")
-            if not relative:
-                continue
-            local_path = LOCAL_DATA_DIR / relative
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            blob.download_to_filename(str(local_path))
-
-        print(f"Dataset downloaded to {LOCAL_DATA_DIR}")
-
-    # ─────────────────────────────
-    # 3. YOLO26n 転移学習
-    # ─────────────────────────────
-    # data.yaml の path を実行環境の絶対パスに書き換えた一時ファイルを作成
-    # （data.yaml の path: /tmp/dataset はクラウド用のため、ローカルでは上書きが必要）
-    src_yaml = LOCAL_DATA_DIR / "data.yaml"
-    data_cfg = yaml.safe_load(src_yaml.read_text())
-    data_cfg["path"] = str(LOCAL_DATA_DIR.resolve())
-    tmp_yaml = tempfile.NamedTemporaryFile(suffix=".yaml", delete=False, mode="w")
-    yaml.dump(data_cfg, tmp_yaml)
-    tmp_yaml.flush()
-
-    print("Starting YOLO26n training...")
-    model = YOLO("yolo26n.pt")
-
-    results = model.train(
-        data=tmp_yaml.name,
-        epochs=args.epochs,
-        lr0=args.lr0,
-        freeze=args.freeze,
-        imgsz=args.imgsz,
-        patience=args.patience,
-        augment=True,
-        project="/tmp/runs",
-        name="train",
-        exist_ok=True,
-    )
-
-    # ─────────────────────────────
-    # 4. メトリクスを Vertex AI Experiments へ記録
-    # ─────────────────────────────
-    metrics = results.results_dict
-    aiplatform.log_metrics({
-        "mAP50":    metrics.get("metrics/mAP50(B)", 0),
-        "mAP50-95": metrics.get("metrics/mAP50-95(B)", 0),
-        "precision": metrics.get("metrics/precision(B)", 0),
-        "recall":    metrics.get("metrics/recall(B)", 0),
-    })
-    print(f"mAP50: {metrics.get('metrics/mAP50(B)', 0):.4f}")
-
-    # ─────────────────────────────
-    # 5. best.pt を GCS へアップロード
-    # ─────────────────────────────
-    best_pt = LOCAL_RUN_DIR / "weights" / "best.pt"
-
-    if args.local_data_dir:
-        # ローカル動作確認モード: GCS アップロードをスキップ
-        print(f"[LOCAL MODE] Model saved at: {best_pt}")
-    else:
-        gcs_model_path = f"models/{args.run_name}/best.pt"
-        bucket.blob(gcs_model_path).upload_from_filename(str(best_pt))
-        print(f"Model uploaded to gs://{args.data_bucket}/{gcs_model_path}")
-
-        # metrics.json を GCS へ保存（パイプラインの evaluate ステップが参照する）
-        metrics_data = {
-            "mAP50":     metrics.get("metrics/mAP50(B)", 0),
-            "mAP50-95":  metrics.get("metrics/mAP50-95(B)", 0),
-            "precision": metrics.get("metrics/precision(B)", 0),
-            "recall":    metrics.get("metrics/recall(B)", 0),
-        }
-        metrics_path = f"models/{args.run_name}/metrics.json"
-        bucket.blob(metrics_path).upload_from_string(json.dumps(metrics_data, indent=2))
-        print(f"Metrics saved to gs://{args.data_bucket}/{metrics_path}")
-
+print(f"[3/3] Uploading best.pt → {gcs_uri}/best.pt")
+gcs.bucket(bucket_name).blob(blob_path).upload_from_filename(str(best_pt))
 print("Training complete!")

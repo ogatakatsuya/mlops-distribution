@@ -1,43 +1,82 @@
-# Cloud Build 設定
-# pipeline/config.yaml への Push で Terraform の Cloud Build Trigger が自動発火する
+# Cloud Build パイプライン: YOLO 学習 → Cloud Run デプロイ
 #
-# 前提（Phase 0 で一度だけ手動実行）:
-#   REGION=asia-northeast1
-#   docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/mlops/vtuber-predictor:latest serve/
-#   docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/mlops/vtuber-predictor:latest
+# トリガー: pipeline/config.yaml の変更を main ブランチへ push
 #
-# 代入変数（Terraform の Cloud Build Trigger が自動設定）:
-#   _PROJECT_ID  : GCP プロジェクト ID
-#   _REGION      : リージョン（例: asia-northeast1）
-#   _ENDPOINT_ID : Vertex AI Endpoint のフルリソース名
+# 代入変数 (terraform/cloudbuild.tf の substitutions で自動設定される):
+#   _PROJECT_ID     : GCP プロジェクト ID
+#   _REGION         : リージョン (asia-northeast1)
+#   _ENDPOINT_ID    : Cloud Run サービス名 (vtuber-detector)
+#   _WANDB_API_KEY  : W&B API キー (省略可)
+#   _WANDB_PROJECT  : W&B プロジェクト名 (デフォルト: vtuber-detector)
 
 steps:
-  # Step 1: src/train.py を GCS へアップロード
-  # パイプラインの学習コンポーネントが GCS 経由でこのスクリプトを参照する
-  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
-    id: upload-train-script
+  # ── Trainer コンテナのビルド ───────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: build-trainer
+    waitFor: ['-']
     args:
-      - gsutil
-      - cp
-      - src/train.py
-      - gs://${_PROJECT_ID}-mlops-data/scripts/train.py
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/${_PROJECT_ID}/mlops/trainer:${BUILD_ID}
+      - src/
 
-  # Step 2: パイプライン定義をコンパイルして Vertex AI Pipelines へ投入
-  - name: "python:3.11"
+  # ── Serving コンテナのビルド ───────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: build-serving
+    waitFor: ['-']
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/${_PROJECT_ID}/mlops/serving:${BUILD_ID}
+      - serve/
+
+  # ── Trainer イメージを Artifact Registry にプッシュ ───────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: push-trainer
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${_PROJECT_ID}/mlops/trainer:${BUILD_ID}
+    waitFor: [build-trainer]
+
+  # ── Serving イメージを Artifact Registry にプッシュ ───────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: push-serving
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${_PROJECT_ID}/mlops/serving:${BUILD_ID}
+    waitFor: [build-serving]
+
+  # ── Vertex AI Pipelines へ投入してすぐ終了 ────────────────────────────
+  # Cloud Build はパイプラインを submit したら即終了する (学習完了は待たない)
+  # 以降の training → deploy は Vertex AI が非同期に管理する
+  - name: python:3.11-slim
     id: submit-pipeline
-    waitFor: ["upload-train-script"]
     entrypoint: bash
     args:
       - -c
       - |
-        pip install \
-          "google-cloud-aiplatform>=1.60.0" \
-          "kfp>=2.0" \
-          "pyyaml>=6.0" \
-          -q
-        PYTHONPATH=/workspace python pipeline/definition.py \
-          --project_id=${_PROJECT_ID} \
-          --region=${_REGION} \
-          --endpoint_id=${_ENDPOINT_ID}
+        pip install -q google-cloud-aiplatform kfp pyyaml &&
+        python -m pipeline.submit
+    env:
+      - PROJECT_ID=${_PROJECT_ID}
+      - REGION=${_REGION}
+      - DATA_BUCKET=${_PROJECT_ID}-mlops-data
+      - PIPELINE_BUCKET=${_PROJECT_ID}-mlops-pipeline
+      - TRAINER_IMAGE=${_REGION}-docker.pkg.dev/${_PROJECT_ID}/mlops/trainer:${BUILD_ID}
+      - SERVING_IMAGE=${_REGION}-docker.pkg.dev/${_PROJECT_ID}/mlops/serving:${BUILD_ID}
+      - ENDPOINT_ID=${_ENDPOINT_ID}
+      - BUILD_ID=${BUILD_ID}
+      - VERTEX_SA=mlops-vertex-ai@${_PROJECT_ID}.iam.gserviceaccount.com
+      - WANDB_API_KEY=${_WANDB_API_KEY}
+      - WANDB_PROJECT=${_WANDB_PROJECT}
+    waitFor: [push-trainer, push-serving]
 
-timeout: "600s"
+substitutions:
+  _PROJECT_ID: mlops-489016
+  _REGION: asia-northeast1
+  _ENDPOINT_ID: vtuber-detector
+  _WANDB_API_KEY: ""
+  _WANDB_PROJECT: vtuber-detector
+
+options:
+  logging: CLOUD_LOGGING_ONLY
