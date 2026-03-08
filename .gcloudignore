@@ -1,0 +1,24 @@
+.gcloudignore
+.git
+.gitignore
+
+# Python 仮想環境 (サイズが大きいため除外)
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
+# データセット・モデルファイル (GCS から参照するため除外)
+vtuber_dataset/
+*.pt
+*.onnx
+
+# Terraform state
+terraform/.terraform
+terraform/terraform.tfstate*
+
+# その他
+preprocess/
+*.egg-info
+.DS_Store

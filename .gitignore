@@ -4,3 +4,4 @@ design
 terraform.tfstate
 terraform.tfstate.backup
 .terraform/
+*.pt
