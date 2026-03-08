@@ -273,7 +273,6 @@ https://<CLOUD_RUN_URL>/predict
 │   └── requirements.txt
 ├── demo/
 │   ├── app.py               # Streamlit 推論デモ（Local / API モード）
-│   └── dataset_viewer.py    # データセットビジュアライザー
 ├── preprocess/
 │   ├── distill.py           # Grounding DINO による自動ラベリング
 │   ├── fix_labels.py        # ラベル混入クリーンアップ
